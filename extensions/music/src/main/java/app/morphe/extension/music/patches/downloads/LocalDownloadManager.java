@@ -34,7 +34,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 import app.morphe.extension.music.patches.scrobbling.ScrobbleManager;
@@ -53,25 +55,39 @@ import app.morphe.extension.shared.spoof.requests.StreamingDataRequest;
 /** Downloads the already resolved InnerTube audio stream without leaving YouTube Music. */
 public final class LocalDownloadManager {
 
+    // === YENİ: Liked Songs toplu indirme dinleyicisi ===
+    /** Callback used by the Liked Songs bulk-download flow. All methods run on the main thread. */
+    public interface LikedSongsListener {
+        /** Fired once, right before the playlist is fetched. */
+        void onStarting();
+        /** Fired as the playlist is fetched, before any track is downloaded. */
+        void onFetching(int foundSoFar);
+        /** Fired before each track is downloaded. {@code current} is 1-based. */
+        void onProgress(int current, int total);
+        /** Fired when the whole batch finished. */
+        void onComplete(int successCount, int failedCount);
+        /** Fired when the batch could not start at all. */
+        void onFailed(String reason);
+    }
+
     private static final String DOWNLOAD_CHANNEL = "morphe_audio_downloads";
     private static final String USER_AGENT =
             "com.google.android.youtube/19.47.53 (Linux; U; Android 14) gzip";
 
-    /** Ranges are fetched in parallel, which is what makes a download finish in seconds. */
+    /** Batch notification key, separate from per-track notifications. */
+    private static final String LIKED_SONGS_NOTIFICATION_KEY = "liked_songs_batch";
+
+    // === YENİ: Aynı anda iki batch çalışmasını engeller ===
+    private static final AtomicBoolean LIKED_SONGS_RUNNING = new AtomicBoolean(false);
+
     private static final int SEGMENT_COUNT = 4;
     private static final int BUFFER_SIZE = 64 * 1024;
 
-    /**
-     * The system silently drops notifications posted faster than a few per second, which used to
-     * leave stale progress on screen after the download had finished. Updates are spaced out.
-     */
     private static final long NOTIFICATION_INTERVAL_MILLISECONDS = 1000;
     private static final AtomicLong lastNotificationTime = new AtomicLong();
 
     private static final int CONNECT_TIMEOUT_MILLISECONDS = 15_000;
     private static final int READ_TIMEOUT_MILLISECONDS = 30_000;
-
-    /** A range that makes no progress this many times in a row is treated as stalled. */
     private static final int MAX_STALLED_ATTEMPTS = 4;
 
     private static final Pattern VIDEO_ID = Pattern.compile("[A-Za-z0-9_-]{1,20}");
@@ -83,18 +99,18 @@ public final class LocalDownloadManager {
     private LocalDownloadManager() {
     }
 
-    /** Must be called from the main thread. Resolution and downloading happen in background. */
+    // ==================================================================
+    // PUBLIC ENTRY POINTS
+    // ==================================================================
+
+    /** Single-track download. Unchanged from the original API. */
     public static void enqueue(String videoId) {
-        // Every file of a download is named after the id, so anything that is not a plain id
-        // is refused rather than written under a different name than it is looked up by.
         if (!VIDEO_ID.matcher(videoId).matches()) {
             Logger.printDebug(() -> "Refusing to download an unusable id: " + videoId);
             Utils.showToastShort(str("morphe_music_downloads_unknown_track"));
             return;
         }
 
-        // The scrobbler describes whatever the player is on, so it may only be used for that
-        // track. Any other track is described by the video details of its own player response.
         final boolean isPlayingTrack = videoId.equals(VideoInformation.getVideoId());
         ScrobbleManager metadata = ScrobbleManager.getInstance();
 
@@ -105,16 +121,168 @@ public final class LocalDownloadManager {
         Bitmap artwork = isPlayingTrack ? metadata.getCurrentArtwork() : null;
 
         Utils.submitOnBackgroundThread(() -> {
-            downloadBlocking(videoId, title, artist, album, duration, artwork);
+            downloadBlocking(videoId, title, artist, album, duration, artwork, false);
             return null;
         });
     }
 
-    private static void downloadBlocking(String videoId, String title, String artist, String album,
-                                         int duration, Bitmap artwork) {
-        if (!ACTIVE_DOWNLOADS.add(videoId)) {
-            Utils.showToastShort(str("morphe_music_downloads_already_running"));
+    /**
+     * Fetches the user's Liked Songs playlist and downloads every track in order.
+     *
+     * <p>Requires cookies from {@link CookieBridge}. Callers should check
+     * {@link CookieBridge#hasCookies()} first and route the user to
+     * {@link CookieLoginActivity} when it returns {@code false}.</p>
+     *
+     * <p>All callbacks are dispatched on the main thread. Passing a {@code null} listener
+     * is allowed; the batch will still run and show notifications.</p>
+     */
+    public static void enqueueLikedSongs(@Nullable LikedSongsListener listener) {
+        if (!LIKED_SONGS_RUNNING.compareAndSet(false, true)) {
+            postToListener(listener, l -> l.onFailed("already_running"));
             return;
+        }
+
+        postToListener(listener, LikedSongsListener::onStarting);
+
+        Utils.submitOnBackgroundThread(() -> {
+            try {
+                runLikedSongsBatch(listener);
+            } catch (Exception ex) {
+                Logger.printException(() -> "Liked Songs batch crashed", ex);
+                postToListener(listener, l -> l.onFailed("unexpected_error"));
+            } finally {
+                LIKED_SONGS_RUNNING.set(false);
+            }
+            return null;
+        });
+    }
+
+    // ==================================================================
+    // LIKED SONGS BATCH
+    // ==================================================================
+
+    private static void runLikedSongsBatch(@Nullable LikedSongsListener listener) {
+        if (!CookieBridge.hasCookies()) {
+            postToListener(listener, l -> l.onFailed("not_authenticated"));
+            return;
+        }
+
+        Utils.showToastShort("Fetching Liked Songs...");
+        awaitNotificationSlot();
+        showDownloadNotification(LIKED_SONGS_NOTIFICATION_KEY, "Liked Songs",
+                0, true, "Fetching playlist...");
+
+        final List<String> allIds = LikedSongsDownloader.fetchBlocking();
+        if (allIds == null) {
+            awaitNotificationSlot();
+            showDownloadNotification(LIKED_SONGS_NOTIFICATION_KEY, "Liked Songs",
+                    0, false, "Failed to fetch playlist");
+            Utils.showToastShort("Could not fetch Liked Songs. Please sign in again.");
+            postToListener(listener, l -> l.onFailed("fetch_failed"));
+            return;
+        }
+
+        final int found = allIds.size();
+        postToListener(listener, l -> l.onFetching(found));
+
+        if (found == 0) {
+            awaitNotificationSlot();
+            showDownloadNotification(LIKED_SONGS_NOTIFICATION_KEY, "Liked Songs",
+                    100, false, "No liked songs found");
+            Utils.showToastShort("No liked songs found on this account.");
+            postToListener(listener, l -> l.onComplete(0, 0));
+            return;
+        }
+
+        // Skip tracks that are already on disk.
+        File directory = musicDirectory();
+        List<String> toDownload = new ArrayList<>();
+        for (String id : allIds) {
+            if (!isTrackOnDisk(directory, id)) toDownload.add(id);
+        }
+
+        final int total = toDownload.size();
+        if (total == 0) {
+            awaitNotificationSlot();
+            showDownloadNotification(LIKED_SONGS_NOTIFICATION_KEY, "Liked Songs",
+                    100, false, "All tracks already downloaded");
+            Utils.showToastShort("All Liked Songs are already downloaded.");
+            postToListener(listener, l -> l.onComplete(0, 0));
+            return;
+        }
+
+        Utils.showToastShort("Downloading " + total + " liked songs...");
+
+        int success = 0;
+        int failed = 0;
+
+        for (int i = 0; i < total; i++) {
+            String id = toDownload.get(i);
+            final int current = i + 1;
+            final int percentage = (current * 100) / total;
+
+            showDownloadNotification(LIKED_SONGS_NOTIFICATION_KEY, "Liked Songs",
+                    percentage, true, current + " / " + total + " tracks");
+            postToListener(listener, l -> l.onProgress(current, total));
+
+            try {
+                boolean ok = downloadBlocking(id, null, null, null, 0, null, true);
+                if (ok) success++;
+                else failed++;
+            } catch (Exception ex) {
+                Logger.printException(() -> "Batch track failed: " + id, ex);
+                failed++;
+            }
+        }
+
+        awaitNotificationSlot();
+        String summary = success + " downloaded" + (failed > 0 ? ", " + failed + " failed" : "");
+        showDownloadNotification(LIKED_SONGS_NOTIFICATION_KEY, "Liked Songs",
+                100, false, summary);
+        Utils.showToastShort(summary);
+
+        final int s = success;
+        final int f = failed;
+        postToListener(listener, l -> l.onComplete(s, f));
+    }
+
+    private static void postToListener(@Nullable LikedSongsListener listener,
+                                       Consumer<LikedSongsListener> action) {
+        if (listener == null) return;
+        Utils.runOnMainThread(() -> {
+            try {
+                action.accept(listener);
+            } catch (Exception ex) {
+                Logger.printException(() -> "Liked Songs listener failed", ex);
+            }
+        });
+    }
+
+    private static File musicDirectory() {
+        Context context = Utils.getContext();
+        return new File(context.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "Morphe");
+    }
+
+    private static boolean isTrackOnDisk(File directory, String videoId) {
+        return new File(directory, videoId + ".webm").isFile()
+                || new File(directory, videoId + ".m4a").isFile();
+    }
+
+    // ==================================================================
+    // SINGLE-TRACK DOWNLOAD (unchanged except for the new `quiet` flag)
+    // ==================================================================
+
+    /**
+     * @param quiet When {@code true}, per-track toasts and notifications are suppressed so the
+     *              caller can drive a single aggregate notification instead. Used by
+     *              {@link #enqueueLikedSongs}.
+     * @return {@code true} if the track was saved (or already existed), {@code false} on error.
+     */
+    private static boolean downloadBlocking(String videoId, String title, String artist, String album,
+                                            int duration, Bitmap artwork, boolean quiet) {
+        if (!ACTIVE_DOWNLOADS.add(videoId)) {
+            if (!quiet) Utils.showToastShort(str("morphe_music_downloads_already_running"));
+            return false;
         }
 
         try {
@@ -122,11 +290,10 @@ public final class LocalDownloadManager {
             File directory = new File(
                     context.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "Morphe");
 
-            if (new File(directory, videoId + ".webm").isFile()
-                    || new File(directory, videoId + ".m4a").isFile()) {
+            if (isTrackOnDisk(directory, videoId)) {
                 Logger.printDebug(() -> "Already downloaded: " + videoId);
-                Utils.showToastShort(str("morphe_music_downloads_already_saved"));
-                return;
+                if (!quiet) Utils.showToastShort(str("morphe_music_downloads_already_saved"));
+                return true;
             }
 
             ResolvedStream resolved = resolveStream(videoId);
@@ -140,7 +307,6 @@ public final class LocalDownloadManager {
 
             VideoDetails details = resolved.details();
 
-            // Anything the caller already knows wins, the player response only fills the blanks.
             title = firstNotBlank(title, details.getTitle(), videoId);
             artist = firstNotBlank(artist, stripTopic(details.getOwnerChannelName()), "");
             if (duration <= 0) duration = details.getLengthSeconds();
@@ -158,7 +324,7 @@ public final class LocalDownloadManager {
             }
 
             downloadWithResume(videoId, title, format.getUrl(), temporary,
-                    format.getContentLength());
+                    format.getContentLength(), quiet);
 
             if (destination.exists() && !destination.delete()) {
                 throw new IllegalStateException("Could not replace audio file");
@@ -169,12 +335,17 @@ public final class LocalDownloadManager {
             Logger.printDebug(() -> "Saved " + destination + " (" + destination.length() + " bytes)");
 
             OfflineTrack.save(directory, videoId, title, artist, album, duration, artwork);
-            Utils.showToastShort(str("morphe_music_downloads_complete"));
+            if (!quiet) Utils.showToastShort(str("morphe_music_downloads_complete"));
+            return true;
         } catch (Exception ex) {
             Logger.printException(() -> "Local audio download failed: " + videoId, ex);
-            awaitNotificationSlot();
-            showDownloadNotification(videoId, title, 0, false, str("morphe_music_downloads_failed"));
-            Utils.showToastShort(str("morphe_music_downloads_failed"));
+            if (!quiet) {
+                awaitNotificationSlot();
+                showDownloadNotification(videoId, title, 0, false,
+                        str("morphe_music_downloads_failed"));
+                Utils.showToastShort(str("morphe_music_downloads_failed"));
+            }
+            return false;
         } finally {
             ACTIVE_DOWNLOADS.remove(videoId);
         }
@@ -189,14 +360,12 @@ public final class LocalDownloadManager {
         return lastResort;
     }
 
-    /** Music uploads are owned by an "Artist - Topic" channel, which is not the artist name. */
     private static String stripTopic(String channelName) {
         return channelName.endsWith(" - Topic")
                 ? channelName.substring(0, channelName.length() - " - Topic".length())
                 : channelName;
     }
 
-    /** @return Whether a progress update may be posted without the system dropping it. */
     private static boolean canPostProgress() {
         long now = System.currentTimeMillis();
         long previous = lastNotificationTime.get();
@@ -204,11 +373,6 @@ public final class LocalDownloadManager {
                 && lastNotificationTime.compareAndSet(previous, now);
     }
 
-    /**
-     * Waits for the next slot, so a notification that matters is never the one being dropped.
-     * The loop sleeps exactly as long as the slot is away, and repeats only if another thread
-     * took the slot first. Must be called off the main thread.
-     */
     private static void awaitNotificationSlot() {
         while (true) {
             long now = System.currentTimeMillis();
@@ -230,10 +394,6 @@ public final class LocalDownloadManager {
         }
     }
 
-    /**
-     * Some videos come back without any video details, so the thumbnail of the id is used as a
-     * fallback. It exists for every video, while the largest size does not.
-     */
     @Nullable
     private static Bitmap resolveArtwork(String videoId, VideoDetails details) {
         Bitmap artwork = downloadArtwork(largestThumbnail(details));
@@ -268,10 +428,13 @@ public final class LocalDownloadManager {
     }
 
     private static void downloadWithResume(String videoId, String title, String url,
-                                           File temporary, long expectedLength) throws Exception {
-        Utils.showToastShort(str("morphe_music_downloads_started"));
-        awaitNotificationSlot();
-        showDownloadNotification(videoId, title, 0, true, str("morphe_music_downloads_starting"));
+                                           File temporary, long expectedLength, boolean quiet) throws Exception {
+        if (!quiet) {
+            Utils.showToastShort(str("morphe_music_downloads_started"));
+            awaitNotificationSlot();
+            showDownloadNotification(videoId, title, 0, true,
+                    str("morphe_music_downloads_starting"));
+        }
 
         if (expectedLength <= 0) expectedLength = probeContentLength(url);
         final long totalLength = expectedLength;
@@ -279,19 +442,22 @@ public final class LocalDownloadManager {
         if (totalLength <= 0) {
             downloadUnknownLength(url, temporary);
         } else {
-            downloadInParallel(videoId, title, url, temporary, totalLength);
+            downloadInParallel(videoId, title, url, temporary, totalLength, quiet);
         }
 
         if (totalLength > 0 && temporary.length() != totalLength) {
             throw new IllegalStateException(
                     "Incomplete audio file: " + temporary.length() + "/" + totalLength);
         }
-        awaitNotificationSlot();
-        showDownloadNotification(videoId, title, 100, false, str("morphe_music_downloads_complete"));
+        if (!quiet) {
+            awaitNotificationSlot();
+            showDownloadNotification(videoId, title, 100, false,
+                    str("morphe_music_downloads_complete"));
+        }
     }
 
     private static void downloadInParallel(String videoId, String title, String url,
-                                           File temporary, long totalLength) throws Exception {
+                                           File temporary, long totalLength, boolean quiet) throws Exception {
         try (RandomAccessFile file = new RandomAccessFile(temporary, "rw")) {
             file.setLength(totalLength);
         }
@@ -299,7 +465,6 @@ public final class LocalDownloadManager {
         AtomicLong downloaded = new AtomicLong();
         long segmentSize = (totalLength + SEGMENT_COUNT - 1) / SEGMENT_COUNT;
 
-        // Android's ExecutorService is not AutoCloseable, so it is shut down in the finally below.
         //noinspection resource
         ExecutorService executor = Executors.newFixedThreadPool(SEGMENT_COUNT);
         List<Future<?>> futures = new ArrayList<>();
@@ -312,7 +477,7 @@ public final class LocalDownloadManager {
 
                 futures.add(executor.submit(() -> {
                     downloadRange(url, temporary, start, end, downloaded, bytes -> {
-                        if (!canPostProgress()) return;
+                        if (quiet || !canPostProgress()) return;
                         int progress = (int) Math.min(99, bytes * 100 / totalLength);
                         showDownloadNotification(videoId, title, progress, true,
                                 str("morphe_music_downloads_progress", progress));
@@ -430,11 +595,6 @@ public final class LocalDownloadManager {
         }
     }
 
-    /**
-     * Segments report progress from their own threads, and {@code notify} is a oneway binder
-     * call whose order only holds per sending thread. Posting every update from the main thread
-     * stops late progress from replacing the completed state on screen.
-     */
     static void showDownloadNotification(String key, String title, int progress,
                                          boolean ongoing, String text) {
         Utils.runOnMainThread(() -> postDownloadNotification(key, title, progress, ongoing, text));
@@ -470,8 +630,6 @@ public final class LocalDownloadManager {
         StreamingDataRequest request = StreamingDataRequest.getRequestForVideoId(videoId);
         if (request == null) {
             Logger.printDebug(() -> "No cached streaming request for download, resolving: " + videoId);
-            // The clients are named here because the playback order is only set up while spoofing
-            // is on, and a download needs a client that answers with plain urls either way.
             request = StreamingDataRequest.fetchRequestForDownload(videoId,
                     SpoofVideoStreamsPatch.getAvailableClients(),
                     Settings.SPOOF_VIDEO_STREAMS_CLIENT_TYPE.get());
