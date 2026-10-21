@@ -115,9 +115,8 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     private LinearLayout contentContainer;
     private ImageButton viewToggleBtn;
 
-    /** "♥ Download Liked Songs" chip button. Null until the header is built. */
-    @Nullable
-    private TextView likedSongsButton;
+    @Nullable private TextView likedSongsButton;
+    @Nullable private TextView fromLinkButton;
 
     private boolean showingPause;
     private boolean isGridView = true;
@@ -125,13 +124,8 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     private List<OfflineTrack> tracks = new ArrayList<>();
     private List<OfflinePlaylist> playlists = new ArrayList<>();
 
-    /** Null = top-level library view. Non-null = the currently opened playlist. */
-    @Nullable
-    private OfflinePlaylist activePlaylist = null;
-
-    /** Playlist waiting for a user-picked cover. */
-    @Nullable
-    private OfflinePlaylist pendingCoverPlaylist = null;
+    @Nullable private OfflinePlaylist activePlaylist = null;
+    @Nullable private OfflinePlaylist pendingCoverPlaylist = null;
 
     private final List<View> rowViews = new ArrayList<>();
     private List<String> displayedPaths = new ArrayList<>();
@@ -142,7 +136,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     private EditText searchBar;
     private boolean userSeeking;
 
-    /** RAM cache that keeps disk reads and collage generation out of the render path. */
     private final LruCache<String, Bitmap> artworkCache = new LruCache<>(60);
 
     private enum SortOrder {
@@ -157,7 +150,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         }
     }
 
-    /** Playlist data model. */
     private static final class OfflinePlaylist {
         final String id;
         String name;
@@ -255,6 +247,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     public void onDestroyView() {
         artworkCache.evictAll();
         likedSongsButton = null;
+        fromLinkButton = null;
         super.onDestroyView();
     }
 
@@ -295,7 +288,25 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     private void refreshDataAndRender() {
         loadTracks();
         loadPlaylists();
+        ensureAllSongsPlaylist();
         renderContent();
+    }
+
+    /**
+     * Migration helper: ensures an "All Songs" playlist exists whenever the on-disk library
+     * is non-empty. Called on every refresh, but only acts when the playlist is missing, so
+     * freshly downloaded tracks continue to be appended by {@link LocalDownloadManager}.
+     */
+    private void ensureAllSongsPlaylist() {
+        if (tracks.isEmpty()) return;
+        for (OfflinePlaylist p : playlists) {
+            if (LocalDownloadManager.ALL_SONGS_PLAYLIST_NAME.equals(p.name)) return;
+        }
+        List<String> ids = new ArrayList<>();
+        for (OfflineTrack t : tracks) ids.add(t.videoId());
+        OfflineStorage.addTracksToNamedPlaylist(musicRoot,
+                LocalDownloadManager.ALL_SONGS_PLAYLIST_NAME, ids);
+        loadPlaylists();
     }
 
     private Comparator<OfflineTrack> comparator() {
@@ -328,30 +339,22 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         header.setOrientation(LinearLayout.VERTICAL);
         header.setPadding(dp(16), dp(8), dp(16), dp(6));
 
-        // ---------- Liked Songs download chip ----------
-        LinearLayout likedRow = new LinearLayout(getActivity());
-        likedRow.setGravity(Gravity.CENTER_VERTICAL);
-        likedRow.setPadding(0, 0, 0, dp(6));
+        LinearLayout chipsRow = new LinearLayout(getActivity());
+        chipsRow.setOrientation(LinearLayout.HORIZONTAL);
+        chipsRow.setPadding(0, 0, 0, dp(6));
 
-        likedSongsButton = new TextView(getActivity());
-        likedSongsButton.setText("♥  Download Liked Songs");
-        likedSongsButton.setTextSize(14);
-        likedSongsButton.setTextColor(foreground());
-        likedSongsButton.setTypeface(Typeface.DEFAULT_BOLD);
-        likedSongsButton.setGravity(Gravity.CENTER);
-        likedSongsButton.setPadding(dp(18), dp(10), dp(18), dp(10));
+        likedSongsButton = buildChip("♥  Liked Songs", () -> onLikedSongsClicked());
+        LinearLayout.LayoutParams likedLp = new LinearLayout.LayoutParams(0, -2, 1f);
+        likedLp.setMarginEnd(dp(6));
+        chipsRow.addView(likedSongsButton, likedLp);
 
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(22));
-        bg.setColor(artworkPlaceholder());
-        likedSongsButton.setBackground(new RippleDrawable(
-                ColorStateList.valueOf(rippleColor()), bg, bg));
-        likedSongsButton.setOnClickListener(v -> onLikedSongsClicked());
-        likedRow.addView(likedSongsButton, new LinearLayout.LayoutParams(-1, -2));
+        fromLinkButton = buildChip("🔗  From Link", () -> showRemoteLinkDialog(null));
+        LinearLayout.LayoutParams linkLp = new LinearLayout.LayoutParams(0, -2, 1f);
+        linkLp.setMarginStart(dp(6));
+        chipsRow.addView(fromLinkButton, linkLp);
 
-        header.addView(likedRow, new LinearLayout.LayoutParams(-1, -2));
+        header.addView(chipsRow, new LinearLayout.LayoutParams(-1, -2));
 
-        // ---------- Search bar ----------
         searchBar = CustomDialog.createSearchBar(getActivity(),
                 str("morphe_music_downloads_search_hint"), text -> {
                     query = text.trim().toLowerCase(Locale.ROOT);
@@ -361,7 +364,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         searchBar.setAlpha(0f);
         header.addView(searchBar, new LinearLayout.LayoutParams(-1, 0));
 
-        // ---------- Toolbar row ----------
         LinearLayout line = new LinearLayout(getActivity());
         line.setGravity(Gravity.CENTER_VERTICAL);
         line.setPadding(0, dp(8), 0, 0);
@@ -400,6 +402,24 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         return header;
     }
 
+    private TextView buildChip(String label, Runnable onClick) {
+        TextView chip = new TextView(getActivity());
+        chip.setText(label);
+        chip.setTextSize(14);
+        chip.setTextColor(foreground());
+        chip.setTypeface(Typeface.DEFAULT_BOLD);
+        chip.setGravity(Gravity.CENTER);
+        chip.setPadding(dp(18), dp(10), dp(18), dp(10));
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(22));
+        bg.setColor(artworkPlaceholder());
+        chip.setBackground(new RippleDrawable(
+                ColorStateList.valueOf(rippleColor()), bg, bg));
+        chip.setOnClickListener(v -> onClick.run());
+        return chip;
+    }
+
     // ==================================================================
     // LIKED SONGS FLOW
     // ==================================================================
@@ -417,7 +437,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     private void promptForSignIn() {
         if (getActivity() == null) return;
 
-        // Optional hint if the device already has a Google account configured.
         final boolean hasAccount = CookieBridge.hasGoogleAccount(getActivity());
         final String message = hasAccount
                 ? "Your Google account is already on this device.\n\n"
@@ -447,7 +466,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
 
                     @Override
                     public void onCancelled() {
-                        // User dismissed the dialog; nothing else to do.
                     }
                 });
         dialog.show();
@@ -459,20 +477,14 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         likedSongsButton.setText("♥  Downloading…");
 
         LocalDownloadManager.enqueueLikedSongs(new LocalDownloadManager.LikedSongsListener() {
-            @Override
-            public void onStarting() {
-                // Manager shows its own toast.
-            }
+            @Override public void onStarting() { }
 
             @Override
             public void onFetching(int foundSoFar) {
-                // Manager shows its own toast.
+                refreshDataAndRender();
             }
 
-            @Override
-            public void onProgress(int current, int total) {
-                // Batch notification is updated by the manager itself.
-            }
+            @Override public void onProgress(int current, int total) { }
 
             @Override
             public void onComplete(int successCount, int failedCount) {
@@ -498,7 +510,159 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     private void restoreLikedButton() {
         if (likedSongsButton == null) return;
         likedSongsButton.setEnabled(true);
-        likedSongsButton.setText("♥  Download Liked Songs");
+        likedSongsButton.setText("♥  Liked Songs");
+    }
+
+    // ==================================================================
+    // REMOTE LINK FLOW
+    // ==================================================================
+
+    private void showRemoteLinkDialog(@Nullable OfflinePlaylist targetPlaylist) {
+        if (getActivity() == null || getActivity().isFinishing()) return;
+
+        EditText input = new EditText(getActivity());
+        input.setHint("Playlist URL or ID");
+        input.setSingleLine(true);
+        input.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        new AlertDialog.Builder(getActivity())
+                .setTitle(targetPlaylist == null
+                        ? "Download from link"
+                        : "Add from link to " + targetPlaylist.name)
+                .setMessage("Paste a YouTube Music playlist URL, or just its ID "
+                          + "(e.g. PL..., OLAK5uy_...).")
+                .setView(input)
+                .setPositiveButton("Fetch", (d, w) -> {
+                    String raw = input.getText().toString().trim();
+                    if (raw.isEmpty()) {
+                        Utils.showToastShort("Nothing to fetch");
+                        return;
+                    }
+                    fetchAndSelectRange(raw, targetPlaylist);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void fetchAndSelectRange(String rawInput, @Nullable OfflinePlaylist targetPlaylist) {
+        if (getActivity() == null) return;
+
+        AlertDialog loading = new AlertDialog.Builder(getActivity())
+                .setTitle("Fetching playlist")
+                .setMessage("Please wait…")
+                .setCancelable(false)
+                .create();
+        loading.show();
+
+        new Thread(() -> {
+            RemotePlaylistFetcher.Result result =
+                    RemotePlaylistFetcher.fetchBlocking(rawInput);
+            if (getActivity() == null) return;
+            getActivity().runOnUiThread(() -> {
+                loading.dismiss();
+                if (result == null) {
+                    Utils.showToastShort("Could not fetch playlist. Sign in again if it is private.");
+                    return;
+                }
+                if (result.videoIds().isEmpty()) {
+                    Utils.showToastShort("Playlist is empty or inaccessible.");
+                    return;
+                }
+                showRangeSelectionDialog(result, targetPlaylist);
+            });
+        }, "remote-playlist-fetch").start();
+    }
+
+    private void showRangeSelectionDialog(RemotePlaylistFetcher.Result result,
+                                          @Nullable OfflinePlaylist targetPlaylist) {
+        if (getActivity() == null) return;
+
+        final List<String> ids = result.videoIds();
+        final int total = ids.size();
+
+        final String[] labels = {
+                "All tracks (" + total + ")",
+                "First 25",
+                "26 – 50",
+                "51 – 75",
+                "76 – 100",
+                "Last 25",
+                "Last 50",
+                "Last 100"
+        };
+
+        new AlertDialog.Builder(getActivity())
+                .setTitle(result.title())
+                .setMessage(total + " tracks found")
+                .setItems(labels, (d, which) -> {
+                    int[] range = computeRange(which, total);
+                    int from = range[0];
+                    int to = range[1];
+                    if (from >= to) {
+                        Utils.showToastShort("Nothing to download in that range.");
+                        return;
+                    }
+                    List<String> selected = new ArrayList<>(ids.subList(from, to));
+                    String playlistName = targetPlaylist != null
+                            ? targetPlaylist.name
+                            : result.title();
+                    startRemotePlaylistDownload(playlistName, selected);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private int[] computeRange(int which, int total) {
+        switch (which) {
+            case 0: return new int[]{0, total};
+            case 1: return new int[]{0, Math.min(25, total)};
+            case 2: return new int[]{25, Math.min(50, total)};
+            case 3: return new int[]{50, Math.min(75, total)};
+            case 4: return new int[]{75, Math.min(100, total)};
+            case 5: return new int[]{Math.max(0, total - 25), total};
+            case 6: return new int[]{Math.max(0, total - 50), total};
+            case 7: return new int[]{Math.max(0, total - 100), total};
+            default: return new int[]{0, total};
+        }
+    }
+
+    private void startRemotePlaylistDownload(String playlistName, List<String> selectedIds) {
+        if (fromLinkButton != null) {
+            fromLinkButton.setEnabled(false);
+            fromLinkButton.setText("🔗  Downloading…");
+        }
+
+        LocalDownloadManager.enqueueRemotePlaylist(playlistName, selectedIds,
+                new LocalDownloadManager.RemotePlaylistListener() {
+                    @Override
+                    public void onStarting(String name, int total) {
+                        Utils.showToastShort("Downloading " + total + " tracks…");
+                    }
+
+                    @Override public void onProgress(int current, int total) { }
+
+                    @Override
+                    public void onComplete(String name, int successCount, int failedCount) {
+                        restoreLinkButton();
+                        refreshDataAndRender();
+                    }
+
+                    @Override
+                    public void onFailed(String reason) {
+                        restoreLinkButton();
+                        if ("already_running".equals(reason)) {
+                            Utils.showToastShort("Another batch is already running.");
+                        } else {
+                            Utils.showToastShort("Download failed: " + reason);
+                        }
+                    }
+                });
+    }
+
+    private void restoreLinkButton() {
+        if (fromLinkButton == null) return;
+        fromLinkButton.setEnabled(true);
+        fromLinkButton.setText("🔗  From Link");
     }
 
     // ==================================================================
@@ -539,7 +703,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     // ==================================================================
-    // RENDER
+    // RENDER — main screen now shows playlists only
     // ==================================================================
 
     private void renderContent() {
@@ -560,53 +724,32 @@ public final class LocalDownloadsFragment extends PreferenceFragment
             return;
         }
 
-        // 1. Playlists section
+        // Main screen: playlists only. The flat "all tracks" view has been removed because
+        // it became slow with large libraries; "All Songs" is kept in sync automatically by
+        // LocalDownloadManager so every track is still reachable.
         List<OfflinePlaylist> matchingPlaylists = new ArrayList<>();
         for (OfflinePlaylist p : playlists) {
             if (matchesPlaylistQuery(p)) matchingPlaylists.add(p);
         }
 
-        if (!matchingPlaylists.isEmpty()) {
-            contentContainer.addView(sectionHeader("Playlists (" + matchingPlaylists.size() + ")"));
-            if (isGridView) {
-                renderPlaylistsGrid(matchingPlaylists);
-            } else {
-                for (OfflinePlaylist p : matchingPlaylists) {
-                    contentContainer.addView(playlistLinearRow(p));
-                }
-            }
-        }
-
-        // 2. All songs section
-        List<OfflineTrack> matchingTracks = new ArrayList<>();
-        for (OfflineTrack track : tracks) {
-            if (matchesQuery(track)) {
-                matchingTracks.add(track);
-                displayedPaths.add(track.audioFile().getAbsolutePath());
-            }
-        }
-
-        contentContainer.addView(sectionHeader("All songs (" + matchingTracks.size() + ")"));
-
-        if (matchingTracks.isEmpty()) {
-            TextView empty = text(str(tracks.isEmpty()
-                    ? "morphe_music_downloads_empty"
-                    : "morphe_music_downloads_nothing_found"), 16, secondary());
+        if (matchingPlaylists.isEmpty()) {
+            TextView empty = text(playlists.isEmpty()
+                    ? "No playlists yet.\n\nUse ♥ Liked Songs or 🔗 From Link to get started."
+                    : "No playlists match your search.", 16, secondary());
             empty.setGravity(Gravity.CENTER);
-            empty.setPadding(0, dp(60), 0, 0);
+            empty.setPadding(dp(20), dp(60), dp(20), dp(60));
             contentContainer.addView(empty);
             return;
         }
 
+        contentContainer.addView(sectionHeader("Playlists (" + matchingPlaylists.size() + ")"));
         if (isGridView) {
-            renderTracksGrid(matchingTracks, null);
+            renderPlaylistsGrid(matchingPlaylists);
         } else {
-            for (OfflineTrack track : matchingTracks) {
-                contentContainer.addView(songLinearRow(track, null));
+            for (OfflinePlaylist p : matchingPlaylists) {
+                contentContainer.addView(playlistLinearRow(p));
             }
         }
-
-        markPlayingRow();
     }
 
     private void renderActivePlaylistView(OfflinePlaylist playlist) {
@@ -625,7 +768,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         topBar.addView(backBtn);
         contentContainer.addView(topBar);
 
-        // Hero card
         LinearLayout hero = new LinearLayout(getActivity());
         hero.setGravity(Gravity.CENTER_VERTICAL);
         hero.setPadding(dp(8), dp(8), dp(8), dp(16));
@@ -1134,6 +1276,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         String[] items = {
                 "Play playlist",
                 "Add / remove songs",
+                "Add songs from link",
                 "Change cover",
                 "Rename",
                 "Delete playlist"
@@ -1151,9 +1294,10 @@ public final class LocalDownloadsFragment extends PreferenceFragment
                     }
                 }
                 case 1 -> showAddRemoveTracksDialog(playlist);
-                case 2 -> showCoverOptionsMenu(anchor, playlist);
-                case 3 -> showRenamePlaylistDialog(playlist);
-                case 4 -> confirm("Delete playlist",
+                case 2 -> showRemoteLinkDialog(playlist);
+                case 3 -> showCoverOptionsMenu(anchor, playlist);
+                case 4 -> showRenamePlaylistDialog(playlist);
+                case 5 -> confirm("Delete playlist",
                         playlist.name + " will be deleted. (Songs stay on the device)",
                         () -> {
                             OfflineStorage.delete(playlist.jsonFile);

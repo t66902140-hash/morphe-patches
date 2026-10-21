@@ -15,6 +15,9 @@ import android.graphics.Rect;
 
 import androidx.annotation.Nullable;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -22,7 +25,9 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import app.morphe.extension.shared.Logger;
 
@@ -72,11 +77,6 @@ final class OfflineStorage {
         }
     }
 
-    /**
-     * Covers are stored at 1200px, so list rows decode a sample rather than the full bitmap.
-     *
-     * @param maxSize Longest edge to decode.
-     */
     @Nullable
     static Bitmap decodeArtwork(File file, int maxSize) {
         if (file == null || !file.isFile()) return null;
@@ -91,9 +91,6 @@ final class OfflineStorage {
         return BitmapFactory.decodeFile(path, options);
     }
 
-    /**
-     * Galeri'den seçilen resmi belleği yormadan (inSampleSize ile) okur ve tam kare (1:1) kırpar.
-     */
     @Nullable
     static Bitmap decodeStreamAndCropSquare(InputStream input, int targetSize) throws IOException {
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
@@ -131,9 +128,6 @@ final class OfflineStorage {
         return cropped;
     }
 
-    /**
-     * İlk 4 şarkının kapağından 2x2 ızgara kolaj kapağı oluşturur.
-     */
     @Nullable
     static Bitmap createCollage(List<Bitmap> bitmaps, int targetSize) {
         if (bitmaps == null || bitmaps.isEmpty()) return null;
@@ -163,10 +157,75 @@ final class OfflineStorage {
         return new Rect(left, top, left + edge, top + edge);
     }
 
-    /** Best effort removal, so a stale file cannot silently keep a download alive. */
     static void delete(File file) {
         if (file != null && file.exists() && !file.delete()) {
             Logger.printException(() -> "Could not delete: " + file);
+        }
+    }
+
+    /**
+     * Creates a playlist with the given name, or appends to it if one already exists.
+     * Duplicate video IDs are silently dropped, so calling this repeatedly is safe.
+     *
+     * <p>Called by the download manager to auto-populate the "Favorites" playlist after a
+     * Liked Songs batch, and by the UI to persist a freshly downloaded remote playlist.</p>
+     */
+    static void addTracksToNamedPlaylist(File musicRoot, String playlistName, List<String> videoIds) {
+        if (musicRoot == null || playlistName == null || playlistName.isBlank()
+                || videoIds == null || videoIds.isEmpty()) return;
+
+        File dir = new File(musicRoot, "playlists");
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            Logger.printException(() -> "Could not create playlists directory: " + dir);
+            return;
+        }
+
+        File target = null;
+        String existingId = null;
+        List<String> existingIds = new ArrayList<>();
+
+        File[] files = dir.listFiles(f -> f.isFile() && f.getName().endsWith(".json"));
+        if (files != null) {
+            for (File f : files) {
+                try {
+                    JSONObject obj = new JSONObject(readText(f));
+                    if (playlistName.equals(obj.optString("name"))) {
+                        target = f;
+                        existingId = obj.optString("id", f.getName().replace(".json", ""));
+                        JSONArray arr = obj.optJSONArray("videoIds");
+                        if (arr != null) {
+                            for (int i = 0; i < arr.length(); i++) {
+                                String v = arr.optString(i, "");
+                                if (!v.isEmpty()) existingIds.add(v);
+                            }
+                        }
+                        break;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        for (String id : videoIds) {
+            if (id != null && !id.isEmpty() && !existingIds.contains(id)) {
+                existingIds.add(id);
+            }
+        }
+
+        try {
+            if (target == null) {
+                existingId = UUID.randomUUID().toString().substring(0, 8);
+                target = new File(dir, existingId + ".json");
+            }
+            JSONArray arr = new JSONArray();
+            for (String id : existingIds) arr.put(id);
+            JSONObject obj = new JSONObject()
+                    .put("id", existingId)
+                    .put("name", playlistName)
+                    .put("videoIds", arr);
+            writeText(target, obj.toString());
+        } catch (Exception ex) {
+            Logger.printException(() -> "Could not save playlist: " + playlistName, ex);
         }
     }
 }

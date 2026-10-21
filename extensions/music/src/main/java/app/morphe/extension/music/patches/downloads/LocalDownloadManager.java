@@ -27,6 +27,7 @@ import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
@@ -55,30 +56,40 @@ import app.morphe.extension.shared.spoof.requests.StreamingDataRequest;
 /** Downloads the already resolved InnerTube audio stream without leaving YouTube Music. */
 public final class LocalDownloadManager {
 
-    // === YENİ: Liked Songs toplu indirme dinleyicisi ===
-    /** Callback used by the Liked Songs bulk-download flow. All methods run on the main thread. */
     public interface LikedSongsListener {
-        /** Fired once, right before the playlist is fetched. */
         void onStarting();
-        /** Fired as the playlist is fetched, before any track is downloaded. */
         void onFetching(int foundSoFar);
-        /** Fired before each track is downloaded. {@code current} is 1-based. */
         void onProgress(int current, int total);
-        /** Fired when the whole batch finished. */
         void onComplete(int successCount, int failedCount);
-        /** Fired when the batch could not start at all. */
         void onFailed(String reason);
     }
+
+    public interface RemotePlaylistListener {
+        void onStarting(String playlistName, int total);
+        void onProgress(int current, int total);
+        void onComplete(String playlistName, int successCount, int failedCount);
+        void onFailed(String reason);
+    }
+
+    /** Playlist used for auto-saving Liked Songs after a successful fetch. */
+    public static final String FAVORITES_PLAYLIST_NAME = "Favorites";
+
+    /**
+     * Playlist that automatically receives every successfully downloaded track. Kept in sync
+     * with the on-disk audio files so the library can hide the flat "all tracks" list from the
+     * main screen and only show playlists there.
+     */
+    public static final String ALL_SONGS_PLAYLIST_NAME = "All Songs";
 
     private static final String DOWNLOAD_CHANNEL = "morphe_audio_downloads";
     private static final String USER_AGENT =
             "com.google.android.youtube/19.47.53 (Linux; U; Android 14) gzip";
 
-    /** Batch notification key, separate from per-track notifications. */
     private static final String LIKED_SONGS_NOTIFICATION_KEY = "liked_songs_batch";
+    private static final String REMOTE_PLAYLIST_NOTIFICATION_PREFIX = "remote_playlist_";
 
-    // === YENİ: Aynı anda iki batch çalışmasını engeller ===
     private static final AtomicBoolean LIKED_SONGS_RUNNING = new AtomicBoolean(false);
+    private static final AtomicBoolean REMOTE_PLAYLIST_RUNNING = new AtomicBoolean(false);
 
     private static final int SEGMENT_COUNT = 4;
     private static final int BUFFER_SIZE = 64 * 1024;
@@ -103,7 +114,6 @@ public final class LocalDownloadManager {
     // PUBLIC ENTRY POINTS
     // ==================================================================
 
-    /** Single-track download. Unchanged from the original API. */
     public static void enqueue(String videoId) {
         if (!VIDEO_ID.matcher(videoId).matches()) {
             Logger.printDebug(() -> "Refusing to download an unusable id: " + videoId);
@@ -126,16 +136,6 @@ public final class LocalDownloadManager {
         });
     }
 
-    /**
-     * Fetches the user's Liked Songs playlist and downloads every track in order.
-     *
-     * <p>Requires cookies from {@link CookieBridge}. Callers should check
-     * {@link CookieBridge#hasCookies()} first and route the user to
-     * {@link CookieLoginActivity} when it returns {@code false}.</p>
-     *
-     * <p>All callbacks are dispatched on the main thread. Passing a {@code null} listener
-     * is allowed; the batch will still run and show notifications.</p>
-     */
     public static void enqueueLikedSongs(@Nullable LikedSongsListener listener) {
         if (!LIKED_SONGS_RUNNING.compareAndSet(false, true)) {
             postToListener(listener, l -> l.onFailed("already_running"));
@@ -152,6 +152,37 @@ public final class LocalDownloadManager {
                 postToListener(listener, l -> l.onFailed("unexpected_error"));
             } finally {
                 LIKED_SONGS_RUNNING.set(false);
+            }
+            return null;
+        });
+    }
+
+    public static void enqueueRemotePlaylist(
+            String playlistName,
+            List<String> videoIds,
+            @Nullable RemotePlaylistListener listener) {
+        if (playlistName == null || playlistName.isBlank()
+                || videoIds == null || videoIds.isEmpty()) {
+            postToRemoteListener(listener, l -> l.onFailed("empty_input"));
+            return;
+        }
+        if (!REMOTE_PLAYLIST_RUNNING.compareAndSet(false, true)) {
+            postToRemoteListener(listener, l -> l.onFailed("already_running"));
+            return;
+        }
+
+        final String name = playlistName;
+        final List<String> ids = new ArrayList<>(videoIds);
+        postToRemoteListener(listener, l -> l.onStarting(name, ids.size()));
+
+        Utils.submitOnBackgroundThread(() -> {
+            try {
+                runRemotePlaylistBatch(name, ids, listener);
+            } catch (Exception ex) {
+                Logger.printException(() -> "Remote playlist batch crashed", ex);
+                postToRemoteListener(listener, l -> l.onFailed("unexpected_error"));
+            } finally {
+                REMOTE_PLAYLIST_RUNNING.set(false);
             }
             return null;
         });
@@ -194,8 +225,9 @@ public final class LocalDownloadManager {
             return;
         }
 
-        // Skip tracks that are already on disk.
         File directory = musicDirectory();
+        OfflineStorage.addTracksToNamedPlaylist(directory, FAVORITES_PLAYLIST_NAME, allIds);
+
         List<String> toDownload = new ArrayList<>();
         for (String id : allIds) {
             if (!isTrackOnDisk(directory, id)) toDownload.add(id);
@@ -258,6 +290,83 @@ public final class LocalDownloadManager {
         });
     }
 
+    // ==================================================================
+    // REMOTE PLAYLIST BATCH
+    // ==================================================================
+
+    private static void runRemotePlaylistBatch(String playlistName, List<String> videoIds,
+                                               @Nullable RemotePlaylistListener listener) {
+        File directory = musicDirectory();
+        OfflineStorage.addTracksToNamedPlaylist(directory, playlistName, videoIds);
+
+        final String notificationKey = REMOTE_PLAYLIST_NOTIFICATION_PREFIX
+                + playlistName.hashCode();
+
+        List<String> toDownload = new ArrayList<>();
+        for (String id : videoIds) {
+            if (!isTrackOnDisk(directory, id)) toDownload.add(id);
+        }
+
+        final int total = toDownload.size();
+        if (total == 0) {
+            awaitNotificationSlot();
+            showDownloadNotification(notificationKey, playlistName,
+                    100, false, "All tracks already downloaded");
+            Utils.showToastShort("All selected tracks already downloaded.");
+            postToRemoteListener(listener, l -> l.onComplete(playlistName, 0, 0));
+            return;
+        }
+
+        Utils.showToastShort("Downloading " + total + " tracks from " + playlistName + "...");
+
+        int success = 0;
+        int failed = 0;
+
+        for (int i = 0; i < total; i++) {
+            String id = toDownload.get(i);
+            final int current = i + 1;
+            final int percentage = (current * 100) / total;
+
+            showDownloadNotification(notificationKey, playlistName,
+                    percentage, true, current + " / " + total + " tracks");
+            postToRemoteListener(listener, l -> l.onProgress(current, total));
+
+            try {
+                boolean ok = downloadBlocking(id, null, null, null, 0, null, true);
+                if (ok) success++;
+                else failed++;
+            } catch (Exception ex) {
+                Logger.printException(() -> "Remote playlist track failed: " + id, ex);
+                failed++;
+            }
+        }
+
+        awaitNotificationSlot();
+        String summary = success + " downloaded" + (failed > 0 ? ", " + failed + " failed" : "");
+        showDownloadNotification(notificationKey, playlistName, 100, false, summary);
+        Utils.showToastShort(summary);
+
+        final int s = success;
+        final int f = failed;
+        postToRemoteListener(listener, l -> l.onComplete(playlistName, s, f));
+    }
+
+    private static void postToRemoteListener(@Nullable RemotePlaylistListener listener,
+                                             Consumer<RemotePlaylistListener> action) {
+        if (listener == null) return;
+        Utils.runOnMainThread(() -> {
+            try {
+                action.accept(listener);
+            } catch (Exception ex) {
+                Logger.printException(() -> "Remote playlist listener failed", ex);
+            }
+        });
+    }
+
+    // ==================================================================
+    // HELPERS
+    // ==================================================================
+
     private static File musicDirectory() {
         Context context = Utils.getContext();
         return new File(context.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "Morphe");
@@ -269,15 +378,9 @@ public final class LocalDownloadManager {
     }
 
     // ==================================================================
-    // SINGLE-TRACK DOWNLOAD (unchanged except for the new `quiet` flag)
+    // SINGLE-TRACK DOWNLOAD
     // ==================================================================
 
-    /**
-     * @param quiet When {@code true}, per-track toasts and notifications are suppressed so the
-     *              caller can drive a single aggregate notification instead. Used by
-     *              {@link #enqueueLikedSongs}.
-     * @return {@code true} if the track was saved (or already existed), {@code false} on error.
-     */
     private static boolean downloadBlocking(String videoId, String title, String artist, String album,
                                             int duration, Bitmap artwork, boolean quiet) {
         if (!ACTIVE_DOWNLOADS.add(videoId)) {
@@ -292,6 +395,9 @@ public final class LocalDownloadManager {
 
             if (isTrackOnDisk(directory, videoId)) {
                 Logger.printDebug(() -> "Already downloaded: " + videoId);
+                // Ensure legacy files land in "All Songs" even when re-encountered.
+                OfflineStorage.addTracksToNamedPlaylist(directory, ALL_SONGS_PLAYLIST_NAME,
+                        Collections.singletonList(videoId));
                 if (!quiet) Utils.showToastShort(str("morphe_music_downloads_already_saved"));
                 return true;
             }
@@ -335,6 +441,12 @@ public final class LocalDownloadManager {
             Logger.printDebug(() -> "Saved " + destination + " (" + destination.length() + " bytes)");
 
             OfflineTrack.save(directory, videoId, title, artist, album, duration, artwork);
+
+            // Every successful download goes into "All Songs" so the main screen only has to
+            // render playlists.
+            OfflineStorage.addTracksToNamedPlaylist(directory, ALL_SONGS_PLAYLIST_NAME,
+                    Collections.singletonList(videoId));
+
             if (!quiet) Utils.showToastShort(str("morphe_music_downloads_complete"));
             return true;
         } catch (Exception ex) {
