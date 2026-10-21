@@ -101,9 +101,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
 
     private static final int REQUEST_PICK_COVER = 9401;
 
-    /** Request code for the cookie sign-in flow (Liked Songs bulk download). */
-    private static final int REQUEST_COOKIE_LOGIN = 9402;
-
     private File musicRoot;
     private File playlistsDir;
 
@@ -433,13 +430,27 @@ public final class LocalDownloadsFragment extends PreferenceFragment
         new AlertDialog.Builder(getActivity())
                 .setTitle("Sign in required")
                 .setMessage(message)
-                .setPositiveButton("Continue", (dialog, which) -> {
-                    Intent intent = new Intent(getActivity(), CookieLoginActivity.class);
-                    intent.putExtra(CookieLoginActivity.EXTRA_MODE, CookieLoginActivity.MODE_WEBVIEW);
-                    startActivityForResult(intent, REQUEST_COOKIE_LOGIN);
-                })
+                .setPositiveButton("Continue", (dialog, which) -> showCookieLoginDialog())
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    private void showCookieLoginDialog() {
+        if (getActivity() == null || getActivity().isFinishing()) return;
+        CookieLoginDialog dialog = new CookieLoginDialog(getActivity(),
+                new CookieLoginDialog.Callback() {
+                    @Override
+                    public void onSuccess() {
+                        if (getActivity() == null) return;
+                        getActivity().runOnUiThread(() -> startLikedSongsDownload());
+                    }
+
+                    @Override
+                    public void onCancelled() {
+                        // User dismissed the dialog; nothing else to do.
+                    }
+                });
+        dialog.show();
     }
 
     private void startLikedSongsDownload() {
@@ -491,7 +502,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     // ==================================================================
-    // HEADER HELPERS (unchanged logic, only button text is English now)
+    // HEADER HELPERS
     // ==================================================================
 
     private ImageButton createTextIconButton(String symbol, String description) {
@@ -528,7 +539,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     // ==================================================================
-    // RENDER (all strings translated to English)
+    // RENDER
     // ==================================================================
 
     private void renderContent() {
@@ -956,7 +967,7 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     }
 
     // ==================================================================
-    // DIALOGS (strings translated to English)
+    // DIALOGS
     // ==================================================================
 
     private void showCreatePlaylistDialog() {
@@ -1080,13 +1091,6 @@ public final class LocalDownloadsFragment extends PreferenceFragment
     @Override
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-
-        if (requestCode == REQUEST_COOKIE_LOGIN) {
-            if (resultCode == Activity.RESULT_OK) {
-                startLikedSongsDownload();
-            }
-            return;
-        }
 
         if (requestCode != REQUEST_PICK_COVER || resultCode != Activity.RESULT_OK || data == null) {
             return;
