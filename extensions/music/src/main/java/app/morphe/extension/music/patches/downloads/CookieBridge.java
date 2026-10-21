@@ -219,8 +219,11 @@ public final class CookieBridge {
                 os.write(payload.getBytes(StandardCharsets.UTF_8));
             }
 
-            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
-                Logger.printDebug(() -> "account_menu HTTP " + connection.getResponseCode());
+            // Read the code once; the lambda below cannot call getResponseCode() because
+            // that method declares IOException and `connection` is not effectively final.
+            final int responseCode = connection.getResponseCode();
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                Logger.printDebug(() -> "account_menu HTTP " + responseCode);
                 return false;
             }
 
